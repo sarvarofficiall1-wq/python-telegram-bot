@@ -1,19 +1,26 @@
 """Factory accounting Telegram handlers."""
+
 import logging
-from decimal import Decimal, InvalidOperation
 from datetime import date
+from decimal import Decimal, InvalidOperation
 
 from telegram import ReplyKeyboardMarkup, Update
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler, ConversationHandler, filters
+    Application,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
+
 from bot import db
 
 logger = logging.getLogger(__name__)
 
 DB_KEY = "db"
+REDIS_KEY = "redis"
 
-# Main menu
 ADD_LOAD = "➕ Yuk qabul qilish"
 COPPER = "🔥 Mis qozon"
 BRASS = "🔥 Latun qozon"
@@ -29,449 +36,534 @@ CANCEL = "❌ Bekor qilish"
 MATERIALS = [
     "Qizil oddiy", "Tros", "Qizil lahim", "Sariq", "Radiator Sariq",
     "Radiator qizil", "Quyma sink", "Karbyurator", "Teplo",
-    "Alyumin zapchast", "Alyumin chushka", "Qizil skidka",
+    "Alyumin zapchast", "Alyumin chushka",
 ]
-FURNACES = {COPPER: "Mis", BRASS: "Latun", ALUMINUM: "Alyumin"}
 
-MAIN_MENU = ReplyKeyboardMarkup(
-    [[ADD_LOAD, COPPER], [BRASS, ALUMINUM], [SALE, STOCK], [REPORT, SEARCH],
-     [PROFIT, LOSS]],
-    resize_keyboard=True, is_persistent=True, input_field_placeholder="Bo‘limni tanlang"
-)
-CANCEL_MENU = ReplyKeyboardMarkup([[CANCEL]], resize_keyboard=True)
+FURNACE_MATERIALS = {
+    "mis": ["Qizil oddiy", "Tros", "Qizil lahim"],
+    "latun": ["Sariq", "Radiator Sariq", "Radiator qizil",
+              "Quyma sink", "Karbyurator", "Teplo", "Qizil skidka"],
+    "alyumin": ["Alyumin zapchast", "Alyumin chushka"],
+}
 
-# Conversation states
-(
-    LOAD_DATE, LOAD_VEHICLE, LOAD_PERSON, LOAD_MATERIAL, LOAD_KG, LOAD_PRICE,
-    LOAD_MORE, LOAD_SKIDKA, LOAD_VOZVRAT,
-    FURNACE_DATE, FURNACE_MATERIAL, FURNACE_INPUT, FURNACE_MORE,
-    FURNACE_PRODUCT, FURNACE_FINISHED, FURNACE_SCRAP,
-    SALE_PRODUCT, SALE_KG, SALE_PRICE, SALE_COST,
-    SEARCH_TEXT,
-) = range(21)
+MAIN_KEYBOARD = [
+    [ADD_LOAD],
+    [COPPER, BRASS],
+    [ALUMINUM, SALE],
+    [STOCK, REPORT],
+    [SEARCH, PROFIT, LOSS],
+]
 
-def _pool(context):
-    return context.bot_data.get(DB_KEY)
+LOAD_DATE, LOAD_VEHICLE, LOAD_PERSON, LOAD_MATERIAL, LOAD_KG, LOAD_PRICE, LOAD_MORE, LOAD_SKIDKA, LOAD_VOZVRAT = range(9)
+FURNACE_DATE, FURNACE_MATERIAL, FURNACE_KG, FURNACE_MORE, FURNACE_FINISHED, FURNACE_SCRAP = range(9, 15)
+SALE_PRODUCT, SALE_KG, SALE_PRICE, SALE_COST = range(15, 19)
+SEARCH_TEXT = 19
 
-def _dec(text):
-    return Decimal(str(text).replace(" ", "").replace(",", "."))
 
-def _fmt(n):
-    d = Decimal(str(n or 0))
-    if d == d.to_integral():
-        return f"{int(d):,}".replace(",", " ")
-    return f"{d:,.2f}".replace(",", " ").replace(".", ",")
+def menu_markup():
+    return ReplyKeyboardMarkup(MAIN_KEYBOARD, resize_keyboard=True)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if user:
-        pool = _pool(context)
-        if pool:
+
+def cancel_markup():
+    return ReplyKeyboardMarkup([[CANCEL]], resize_keyboard=True)
+
+
+def parse_decimal(text: str):
+    try:
+        value = Decimal(text.replace(" ", "").replace(",", "."))
+        if value < 0:
+            return None
+        return value
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def pool_from(context):
+    return context.application.bot_data.get(DB_KEY)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pool = pool_from(context)
+    if pool:
+        user = update.effective_user
+        try:
             await db.upsert_user(pool, user.id, user.username, user.first_name)
-    await update.effective_message.reply_text(
-        "🏭 Zavod Hisob tizimiga xush kelibsiz!\n\nKerakli bo‘limni tanlang.",
-        reply_markup=MAIN_MENU,
+        except Exception:
+            logger.exception("Could not save user")
+    await update.message.reply_text(
+        "🏭 Zavod Hisob botiga xush kelibsiz!\n\n"
+        "Bu bot orqali yuk, qozon, ombor, sotuv, foyda va zarar hisoblanadi.",
+        reply_markup=menu_markup(),
     )
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.effective_message.reply_text("❌ Bekor qilindi.", reply_markup=MAIN_MENU)
-    return ConversationHandler.END
 
-async def add_load_start(update, context):
-    context.user_data.clear()
-    context.user_data["load_items"] = []
-    await update.effective_message.reply_text("📅 Yuk kelgan sanani kiriting (YYYY-MM-DD):", reply_markup=CANCEL_MENU)
-    return LOAD_DATE
-
-async def load_date(update, context):
-    try:
-        d = date.fromisoformat(update.effective_message.text.strip())
-    except ValueError:
-        await update.effective_message.reply_text("Sana noto‘g‘ri. Masalan: 2026-09-15")
-        return LOAD_DATE
-    context.user_data["load_date"] = d.isoformat()
-    await update.effective_message.reply_text("🚚 Mashina raqamini kiriting:")
-    return LOAD_VEHICLE
-
-async def load_vehicle(update, context):
-    context.user_data["vehicle"] = update.effective_message.text.strip()
-    await update.effective_message.reply_text("👤 Kimdan / ism-familiya:")
-    return LOAD_PERSON
-
-async def load_person(update, context):
-    context.user_data["person"] = update.effective_message.text.strip()
-    await update.effective_message.reply_text(
-        "📦 Materialni yozing yoki tanlang:\n" + "\n".join(f"• {m}" for m in MATERIALS)
-    )
-    return LOAD_MATERIAL
-
-async def load_material(update, context):
-    text = update.effective_message.text.strip()
-    context.user_data["current_material"] = text
-    await update.effective_message.reply_text(f"⚖️ {text} — kg miqdorini kiriting:")
-    return LOAD_KG
-
-async def load_kg(update, context):
-    try:
-        kg = _dec(update.effective_message.text)
-        if kg <= 0: raise ValueError
-    except Exception:
-        await update.effective_message.reply_text("Kg noto‘g‘ri. Masalan: 3000")
-        return LOAD_KG
-    context.user_data["current_kg"] = kg
-    await update.effective_message.reply_text("💵 1 kg narxini kiriting (so‘m):")
-    return LOAD_PRICE
-
-async def load_price(update, context):
-    try:
-        price = _dec(update.effective_message.text)
-        if price < 0: raise ValueError
-    except Exception:
-        await update.effective_message.reply_text("Narx noto‘g‘ri. Masalan: 48000")
-        return LOAD_PRICE
-    item = {
-        "material": context.user_data["current_material"],
-        "initial_kg": context.user_data["current_kg"],
-        "price": price,
-    }
-    context.user_data["load_items"].append(item)
-    await update.effective_message.reply_text(
-        "Material qo‘shildi. Yana material qo‘shasizmi?\n\n"
-        "Yana material nomini yozing yoki `yo‘q` deb yozing."
-    )
-    return LOAD_MORE
-
-async def load_more(update, context):
-    text = update.effective_message.text.strip()
-    if text.lower() in {"yo‘q", "yoq", "yo'q", "no"}:
-        await update.effective_message.reply_text(
-            "📉 Skidka kg kiriting (bo‘lmasa 0):"
-        )
-        return LOAD_SKIDKA
-    context.user_data["current_material"] = text
-    await update.effective_message.reply_text("⚖️ Kg miqdorini kiriting:")
-    return LOAD_KG
-
-async def load_skidka(update, context):
-    try:
-        x = _dec(update.effective_message.text)
-        if x < 0: raise ValueError
-    except Exception:
-        await update.effective_message.reply_text("Skidka kg noto‘g‘ri. Masalan: 100")
-        return LOAD_SKIDKA
-    context.user_data["skidka"] = x
-    await update.effective_message.reply_text("↩️ Vozvrat kg kiriting (bo‘lmasa 0):")
-    return LOAD_VOZVRAT
-
-async def load_vozvrat(update, context):
-    try:
-        x = _dec(update.effective_message.text)
-        if x < 0: raise ValueError
-    except Exception:
-        await update.effective_message.reply_text("Vozvrat kg noto‘g‘ri. Masalan: 50")
-        return LOAD_VOZVRAT
-    context.user_data["vozvrat"] = x
-    pool = _pool(context)
-    if not pool:
-        await update.effective_message.reply_text("❌ Baza ulanmagan.", reply_markup=MAIN_MENU)
-        return ConversationHandler.END
-    load_id = await db.create_load(
-        pool, context.user_data["load_date"], context.user_data["vehicle"],
-        context.user_data["person"], context.user_data["load_items"],
-        context.user_data["skidka"], x,
-    )
-    summary = await db.get_load(pool, load_id)
-    await update.effective_message.reply_text(
-        _load_text(summary), reply_markup=MAIN_MENU
-    )
-    context.user_data.clear()
-    return ConversationHandler.END
-
-def _load_text(row):
-    lines = [
-        "✅ Yuk qabul qilindi",
-        f"🚚 Mashina: {row['vehicle_no']}",
-        f"👤 Shaxs: {row['person_name']}",
-        f"📅 Sana: {row['received_date']}",
-    ]
-    initial_total = sum(Decimal(str(i["initial_kg"])) * Decimal(str(i["price"])) for i in row["items"])
-    total_kg = sum(Decimal(str(i["initial_kg"])) for i in row["items"])
-    deductions = Decimal(str(row["skidka_kg"])) + Decimal(str(row["vozvrat_kg"]))
-    final_kg = total_kg - deductions
-    final_total = Decimal(0)
-    for item in row["items"]:
-        ikg = Decimal(str(item["initial_kg"]))
-        share = (ikg / total_kg) if total_kg else Decimal(0)
-        item_deduction = deductions * share
-        accepted_item = max(Decimal(0), ikg - item_deduction)
-        item_total = accepted_item * Decimal(str(item["price"]))
-        final_total += item_total
-        lines.append(
-            f"\n📦 {item['material']}: {_fmt(ikg)} kg × {_fmt(item['price'])} = "
-            f"{_fmt(ikg * Decimal(str(item['price'])))} so‘m"
-            f"\n   ✅ Qabul: {_fmt(accepted_item)} kg → {_fmt(item_total)} so‘m"
-        )
-    diff = final_total - initial_total
-    pct = (diff / initial_total * 100) if initial_total else Decimal(0)
-    lines += [
-        f"\n⚖️ Boshlang‘ich: {_fmt(total_kg)} kg",
-        f"📉 Skidka: {_fmt(row['skidka_kg'])} kg",
-        f"↩️ Vozvrat: {_fmt(row['vozvrat_kg'])} kg",
-        f"✅ Yakuniy qabul: {_fmt(final_kg)} kg",
-        f"💰 Boshlang‘ich summa: {_fmt(initial_total)} so‘m",
-        f"💰 Yakuniy summa: {_fmt(final_total)} so‘m",
-        f"📊 Farq: {_fmt(diff)} so‘m ({_fmt(pct)}%)",
-        "📌 Holat: Yakunlandi",
-    ]
-    return "\n".join(lines)
-
-async def furnace_start(update, context):
-    context.user_data.clear()
-    context.user_data["furnace_items"] = []
-    context.user_data["furnace_type"] = FURNACES[update.effective_message.text]
-    await update.effective_message.reply_text("📅 Sana (YYYY-MM-DD):", reply_markup=CANCEL_MENU)
-    return FURNACE_DATE
-
-async def furnace_date(update, context):
-    try:
-        d = date.fromisoformat(update.effective_message.text.strip())
-    except ValueError:
-        await update.effective_message.reply_text("Sana noto‘g‘ri. Masalan: 2026-09-15")
-        return FURNACE_DATE
-    context.user_data["furnace_date"] = d.isoformat()
-    await update.effective_message.reply_text("📦 Birinchi material nomini kiriting:")
-    return FURNACE_MATERIAL
-
-async def furnace_material(update, context):
-    context.user_data["current_material"] = update.effective_message.text.strip()
-    await update.effective_message.reply_text("⚖️ Qozonga berilgan kg:")
-    return FURNACE_INPUT
-
-async def furnace_input(update, context):
-    try:
-        x = _dec(update.effective_message.text)
-        if x <= 0: raise ValueError
-    except Exception:
-        await update.effective_message.reply_text("Kg noto‘g‘ri.")
-        return FURNACE_INPUT
-    context.user_data["furnace_items"].append(
-        {"material": context.user_data["current_material"], "kg": x}
-    )
-    await update.effective_message.reply_text("Yana material qo‘shasizmi? Nomini yozing yoki `yo‘q`.")
-    return FURNACE_MORE
-
-async def furnace_more(update, context):
-    text = update.effective_message.text.strip()
-    if text.lower() in {"yo‘q", "yoq", "yo'q", "no"}:
-        total = sum(i["kg"] for i in context.user_data["furnace_items"])
-        context.user_data["input_total"] = total
-        await update.effective_message.reply_text(
-            f"🔥 Jami kirim: {_fmt(total)} kg\n\n"
-            "🏭 Tayyor mahsulot nomini kiriting (masalan: Mis truba, Latun truba, Alyumin uzuk):"
-        )
-        return FURNACE_PRODUCT
-    context.user_data["current_material"] = text
-    await update.effective_message.reply_text("⚖️ Shu materialdan qozonga berilgan kg:")
-    return FURNACE_INPUT
-
-async def furnace_product(update, context):
-    context.user_data["finished_product"] = update.effective_message.text.strip()
-    await update.effective_message.reply_text("⚖️ Tayyor mahsulot kg:")
-    return FURNACE_FINISHED
-
-async def furnace_finished(update, context):
-    try:
-        x = _dec(update.effective_message.text)
-        if x < 0: raise ValueError
-    except Exception:
-        await update.effective_message.reply_text("Kg noto‘g‘ri.")
-        return FURNACE_FINISHED
-    context.user_data["finished"] = x
-    await update.effective_message.reply_text("♻️ Chiqit (scrap) kg:")
-    return FURNACE_SCRAP
-
-async def furnace_scrap(update, context):
-    try:
-        scrap = _dec(update.effective_message.text)
-        if scrap < 0: raise ValueError
-    except Exception:
-        await update.effective_message.reply_text("Chiqit kg noto‘g‘ri.")
-        return FURNACE_SCRAP
-    inp = context.user_data["input_total"]
-    fin = context.user_data["finished"]
-    loss = inp - fin - scrap
-    if loss < 0:
-        await update.effective_message.reply_text(
-            f"❌ Xato: kirim {_fmt(inp)} kg, tayyor {_fmt(fin)} kg, chiqit {_fmt(scrap)} kg.\n"
-            "Kirimdan tayyor+chiqit katta bo‘lishi mumkin emas. Qaytadan kiriting."
-        )
-        return FURNACE_SCRAP
-    pool = _pool(context)
-    await db.create_furnace(
-        pool, context.user_data["furnace_date"], context.user_data["furnace_type"],
-        context.user_data["furnace_items"], fin, scrap
-    )
-    pct = lambda n: (n / inp * 100) if inp else Decimal(0)
-    await update.effective_message.reply_text(
-        f"✅ Qozon yozildi\n🔥 {context.user_data['furnace_type']}\n"
-        f"📥 Kirim: {_fmt(inp)} kg\n"
-        f"📤 Tayyor: {_fmt(fin)} kg ({_fmt(pct(fin))}%)\n"
-        f"♻️ Chiqit: {_fmt(scrap)} kg ({_fmt(pct(scrap))}%)\n"
-        f"🔻 Yo‘qotish: {_fmt(loss)} kg ({_fmt(pct(loss))}%)\n"
-        f"⚖️ Balans: {_fmt(fin + scrap + loss)} kg",
-        reply_markup=MAIN_MENU
-    )
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def sale_start(update, context):
-    context.user_data.clear()
-    await update.effective_message.reply_text("📦 Sotilgan mahsulot nomi:", reply_markup=CANCEL_MENU)
-    return SALE_PRODUCT
-
-async def sale_product(update, context):
-    context.user_data["product"] = update.effective_message.text.strip()
-    await update.effective_message.reply_text("⚖️ Sotilgan kg:")
-    return SALE_KG
-
-async def sale_kg(update, context):
-    try:
-        x = _dec(update.effective_message.text)
-        if x <= 0: raise ValueError
-    except Exception:
-        await update.effective_message.reply_text("Kg noto‘g‘ri.")
-        return SALE_KG
-    context.user_data["sale_kg"] = x
-    await update.effective_message.reply_text("💵 Sotuv narxi 1 kg (so‘m):")
-    return SALE_PRICE
-
-async def sale_price(update, context):
-    try:
-        x = _dec(update.effective_message.text)
-        if x < 0: raise ValueError
-    except Exception:
-        await update.effective_message.reply_text("Narx noto‘g‘ri.")
-        return SALE_PRICE
-    context.user_data["sale_price"] = x
-    await update.effective_message.reply_text("📉 Tannarx 1 kg (so‘m):")
-    return SALE_COST
-
-async def sale_cost(update, context):
-    try:
-        cost = _dec(update.effective_message.text)
-        if cost < 0: raise ValueError
-    except Exception:
-        await update.effective_message.reply_text("Tannarx noto‘g‘ri.")
-        return SALE_COST
-    pool = _pool(context)
-    kg = context.user_data["sale_kg"]
-    price = context.user_data["sale_price"]
-    sale_id = await db.create_sale(pool, date.today().isoformat(), context.user_data["product"], kg, price, cost)
-    revenue = kg * price
-    profit = kg * (price - cost)
-    await update.effective_message.reply_text(
-        f"✅ Sotuv saqlandi\n📦 {context.user_data['product']}\n"
-        f"⚖️ {_fmt(kg)} kg\n💰 Tushum: {_fmt(revenue)} so‘m\n"
-        f"🟢 Foyda: {_fmt(profit)} so‘m" if profit >= 0 else
-        f"✅ Sotuv saqlandi\n📦 {context.user_data['product']}\n⚖️ {_fmt(kg)} kg\n"
-        f"💰 Tushum: {_fmt(revenue)} so‘m\n🔴 Zarar: {_fmt(-profit)} so‘m",
-        reply_markup=MAIN_MENU
-    )
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def stock(update, context):
-    pool = _pool(context)
-    rows = await db.stock_summary(pool)
-    if not rows:
-        text = "📦 Ombor hozircha bo‘sh."
-    else:
-        text = "📦 OMBOR QOLDIG‘I\n\n" + "\n".join(
-            f"• {r['material']}: {_fmt(r['kg'])} kg" for r in rows if Decimal(str(r['kg'])) != 0
-        )
-        if text.endswith("\n\n"): text = "📦 Ombor hozircha bo‘sh."
-    await update.effective_message.reply_text(text, reply_markup=MAIN_MENU)
-
-async def report(update, context):
-    pool = _pool(context)
-    r = await db.report(pool)
-    await update.effective_message.reply_text(
-        "📊 UMUMIY HISOBOT\n\n"
-        f"📦 Jami kirgan: {_fmt(r['incoming_kg'])} kg\n"
-        f"📤 Qozonlarga berilgan: {_fmt(r['issued_kg'])} kg\n"
-        f"📦 Xomashyo qoldig‘i: {_fmt(r['raw_stock_kg'])} kg\n"
-        f"🏭 Tayyor ishlab chiqarilgan: {_fmt(r['finished_kg'])} kg\n"
-        f"💰 Tushum: {_fmt(r['revenue'])} so‘m\n"
-        f"🟢 Foyda: {_fmt(r['profit'])} so‘m\n"
-        f"🔴 Zarar: {_fmt(r['loss'])} so‘m",
-        reply_markup=MAIN_MENU
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Asosiy menyudan kerakli bo‘limni tanlang.\n"
+        "Ma'lumot kiritishda ❌ Bekor qilish tugmasidan foydalanishingiz mumkin.",
+        reply_markup=menu_markup(),
     )
 
-async def profit(update, context):
-    pool = _pool(context)
-    x = await db.profit_loss(pool)
-    await update.effective_message.reply_text(f"🟢 Jami foyda: {_fmt(x)} so‘m", reply_markup=MAIN_MENU)
 
-async def loss(update, context):
-    pool = _pool(context)
-    x = await db.profit_loss(pool)
-    await update.effective_message.reply_text(f"🔴 Jami zarar: {_fmt(-x) if x < 0 else 0} so‘m", reply_markup=MAIN_MENU)
-
-async def search_start(update, context):
-    await update.effective_message.reply_text("🔎 Mashina raqami yoki ismni kiriting:", reply_markup=CANCEL_MENU)
-    return SEARCH_TEXT
-
-async def search_text(update, context):
-    pool = _pool(context)
-    rows = await db.search_loads(pool, update.effective_message.text.strip())
-    if not rows:
-        text = "❌ Topilmadi."
-    else:
-        text = "🔎 NATIJALAR\n\n" + "\n\n".join(_load_text(r) for r in rows[:5])
-    await update.effective_message.reply_text(text, reply_markup=MAIN_MENU)
-    return ConversationHandler.END
-
-async def help_command(update, context):
-    await update.effective_message.reply_text(
-        "📌 /start — asosiy menyu\n"
-        "Yuk qabul qilish, qozonlar, sotuv, ombor va hisobot bo‘limlari ishlaydi.",
-        reply_markup=MAIN_MENU
-    )
-
-async def menu_router(update, context):
-    text = update.effective_message.text.strip()
-    if text == ADD_LOAD:
-        return await add_load_start(update, context)
-    if text in FURNACES:
-        return await furnace_start(update, context)
-    if text == SALE:
-        return await sale_start(update, context)
-    if text == STOCK:
-        await stock(update, context); return ConversationHandler.END
-    if text == REPORT:
-        await report(update, context); return ConversationHandler.END
-    if text == SEARCH:
-        return await search_start(update, context)
-    if text == PROFIT:
-        await profit(update, context); return ConversationHandler.END
-    if text == LOSS:
-        await loss(update, context); return ConversationHandler.END
-    return ConversationHandler.END
-
-async def error_handler(update, context):
-    logger.exception("Telegram handler error", exc_info=context.error)
-
-async def set_bot_commands(application: Application) -> None:
+async def set_bot_commands(application: Application):
     await application.bot.set_my_commands([
         ("start", "Asosiy menyu"),
         ("help", "Yordam"),
+        ("cancel", "Joriy amalni bekor qilish"),
     ])
 
-def register_handlers(application: Application) -> None:
-    # Each workflow is its own ConversationHandler.
-    application.add_handler(ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(f"^{ADD_LOAD}$"), add_load_start)],
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Bekor qilindi.", reply_markup=menu_markup())
+    return ConversationHandler.END
+
+
+# ---------- Incoming loads ----------
+
+async def load_start(update, context):
+    context.user_data["load"] = {"items": []}
+    await update.message.reply_text(
+        "📅 Yuk kelgan sanani kiriting.\nMasalan: 15.09.2026",
+        reply_markup=cancel_markup(),
+    )
+    return LOAD_DATE
+
+
+async def load_date(update, context):
+    text = update.message.text.strip()
+    try:
+        d, m, y = map(int, text.split("."))
+        context.user_data["load"]["date"] = date(y, m, d)
+    except Exception:
+        await update.message.reply_text("Sana noto‘g‘ri. Masalan: 15.09.2026")
+        return LOAD_DATE
+    await update.message.reply_text("🚚 Mashina raqamini kiriting:")
+    return LOAD_VEHICLE
+
+
+async def load_vehicle(update, context):
+    context.user_data["load"]["vehicle"] = update.message.text.strip()
+    await update.message.reply_text("👤 Haydovchi / shaxs ismini kiriting:")
+    return LOAD_PERSON
+
+
+async def load_person(update, context):
+    context.user_data["load"]["person"] = update.message.text.strip()
+    await update.message.reply_text(
+        "📦 Material nomini yozing.\n"
+        "Masalan: Sariq, Qizil oddiy, Tros..."
+    )
+    return LOAD_MATERIAL
+
+
+async def load_material(update, context):
+    context.user_data["load"]["current_material"] = update.message.text.strip()
+    await update.message.reply_text("⚖️ Shu materialning boshlang‘ich kg miqdorini kiriting:")
+    return LOAD_KG
+
+
+async def load_kg(update, context):
+    value = parse_decimal(update.message.text)
+    if value is None or value <= 0:
+        await update.message.reply_text("Kg noto‘g‘ri. Masalan: 3000")
+        return LOAD_KG
+    context.user_data["load"]["current_kg"] = value
+    await update.message.reply_text("💵 1 kg narxini kiriting:")
+    return LOAD_PRICE
+
+
+async def load_price(update, context):
+    value = parse_decimal(update.message.text)
+    if value is None or value < 0:
+        await update.message.reply_text("Narx noto‘g‘ri. Masalan: 48000")
+        return LOAD_PRICE
+
+    data = context.user_data["load"]
+    data["items"].append({
+        "material": data.pop("current_material"),
+        "initial_kg": data.pop("current_kg"),
+        "price": value,
+    })
+
+    await update.message.reply_text(
+        "Yana boshqa material qo‘shasizmi?",
+        reply_markup=ReplyKeyboardMarkup([["➕ Ha", "✅ Yo‘q"], [CANCEL]], resize_keyboard=True),
+    )
+    return LOAD_MORE
+
+
+async def load_more(update, context):
+    text = update.message.text
+    if text == "➕ Ha":
+        await update.message.reply_text("📦 Keyingi material nomini kiriting:")
+        return LOAD_MATERIAL
+
+    if text != "✅ Yo‘q":
+        await update.message.reply_text("➕ Ha yoki ✅ Yo‘q ni tanlang.")
+        return LOAD_MORE
+
+    await update.message.reply_text("⬇️ Skidka kg kiriting. Bo‘lmasa 0:")
+    return LOAD_SKIDKA
+
+
+async def load_skidka(update, context):
+    value = parse_decimal(update.message.text)
+    if value is None:
+        await update.message.reply_text("Raqam kiriting. Masalan: 100 yoki 0")
+        return LOAD_SKIDKA
+    context.user_data["load"]["skidka"] = value
+    await update.message.reply_text("↩️ Vozvrat kg kiriting. Bo‘lmasa 0:")
+    return LOAD_VOZVRAT
+
+
+async def load_vozvrat(update, context):
+    value = parse_decimal(update.message.text)
+    if value is None:
+        await update.message.reply_text("Raqam kiriting. Masalan: 100 yoki 0")
+        return LOAD_VOZVRAT
+
+    data = context.user_data["load"]
+    pool = pool_from(context)
+    if pool is None:
+        await update.message.reply_text("⚠️ Baza ulanmagan. Railway Variables ni tekshirish kerak.")
+        return ConversationHandler.END
+
+    data["vozvrat"] = value
+    try:
+        load_id = await db.create_load(
+            pool,
+            data["date"],
+            data["vehicle"],
+            data["person"],
+            data["items"],
+            data["skidka"],
+            data["vozvrat"],
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Saqlashda xato: {exc}")
+        return ConversationHandler.END
+
+    initial_total = sum(i["initial_kg"] * i["price"] for i in data["items"])
+    accepted_kg = sum(i["initial_kg"] for i in data["items"]) - data["skidka"] - data["vozvrat"]
+
+    await update.message.reply_text(
+        f"✅ Yuk #{load_id} saqlandi.\n\n"
+        f"🚚 Mashina: {data['vehicle']}\n"
+        f"👤 Shaxs: {data['person']}\n"
+        f"⚖️ Boshlang‘ich: {sum(i['initial_kg'] for i in data['items']):,.3f} kg\n"
+        f"⬇️ Skidka: {data['skidka']:,.3f} kg\n"
+        f"↩️ Vozvrat: {data['vozvrat']:,.3f} kg\n"
+        f"📦 Qabul qilingan: {accepted_kg:,.3f} kg\n"
+        f"💵 Boshlang‘ich qiymat: {initial_total:,.0f} so‘m",
+        reply_markup=menu_markup(),
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ---------- Furnaces ----------
+
+def furnace_start_factory(kind, title):
+    async def start_furnace(update, context):
+        context.user_data["furnace"] = {"kind": kind, "items": []}
+        await update.message.reply_text(
+            f"{title}\n📅 Sana kiriting. Masalan: 15.09.2026",
+            reply_markup=cancel_markup(),
+        )
+        return FURNACE_DATE
+    return start_furnace
+
+
+async def furnace_date(update, context):
+    try:
+        d, m, y = map(int, update.message.text.strip().split("."))
+        context.user_data["furnace"]["date"] = date(y, m, d)
+    except Exception:
+        await update.message.reply_text("Sana noto‘g‘ri. Masalan: 15.09.2026")
+        return FURNACE_DATE
+
+    kind = context.user_data["furnace"]["kind"]
+    names = ", ".join(FURNACE_MATERIALS[kind])
+    await update.message.reply_text(
+        f"Material nomini yozing.\nRuxsat etilganlar: {names}"
+    )
+    return FURNACE_MATERIAL
+
+
+async def furnace_material(update, context):
+    context.user_data["furnace"]["current_material"] = update.message.text.strip()
+    await update.message.reply_text("⚖️ Shu materialdan necha kg qozonga berildi?")
+    return FURNACE_KG
+
+
+async def furnace_kg(update, context):
+    value = parse_decimal(update.message.text)
+    if value is None or value <= 0:
+        await update.message.reply_text("Kg noto‘g‘ri.")
+        return FURNACE_KG
+
+    data = context.user_data["furnace"]
+    data["items"].append({
+        "material": data.pop("current_material"),
+        "kg": value,
+    })
+    await update.message.reply_text(
+        "Yana material qo‘shasizmi?",
+        reply_markup=ReplyKeyboardMarkup([["➕ Ha", "✅ Yo‘q"], [CANCEL]], resize_keyboard=True),
+    )
+    return FURNACE_MORE
+
+
+async def furnace_more(update, context):
+    if update.message.text == "➕ Ha":
+        await update.message.reply_text("Keyingi material nomini kiriting:")
+        return FURNACE_MATERIAL
+    if update.message.text != "✅ Yo‘q":
+        await update.message.reply_text("➕ Ha yoki ✅ Yo‘q ni tanlang.")
+        return FURNACE_MORE
+    await update.message.reply_text("🏭 Tayyor mahsulot necha kg chiqdi?")
+    return FURNACE_FINISHED
+
+
+async def furnace_finished(update, context):
+    value = parse_decimal(update.message.text)
+    if value is None:
+        await update.message.reply_text("Kg noto‘g‘ri.")
+        return FURNACE_FINISHED
+    context.user_data["furnace"]["finished"] = value
+    await update.message.reply_text("♻️ Chiqit necha kg chiqdi?")
+    return FURNACE_SCRAP
+
+
+async def furnace_scrap(update, context):
+    value = parse_decimal(update.message.text)
+    if value is None:
+        await update.message.reply_text("Kg noto‘g‘ri.")
+        return FURNACE_SCRAP
+
+    data = context.user_data["furnace"]
+    pool = pool_from(context)
+    if pool is None:
+        await update.message.reply_text("⚠️ Baza ulanmagan.")
+        return ConversationHandler.END
+
+    input_kg = sum(x["kg"] for x in data["items"])
+    loss = input_kg - data["finished"] - value
+
+    if loss < 0:
+        await update.message.reply_text(
+            f"❌ Hisob noto‘g‘ri: kirim {input_kg:,.3f} kg, "
+            f"tayyor + chiqit {data['finished'] + value:,.3f} kg."
+        )
+        return FURNACE_SCRAP
+
+    try:
+        furnace_id = await db.create_furnace(
+            pool, data["date"], data["kind"], data["items"],
+            data["finished"], value
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Saqlashda xato: {exc}")
+        return ConversationHandler.END
+
+    finished_pct = (data["finished"] / input_kg * 100) if input_kg else 0
+    scrap_pct = (value / input_kg * 100) if input_kg else 0
+    loss_pct = (loss / input_kg * 100) if input_kg else 0
+
+    await update.message.reply_text(
+        f"✅ Qozon #{furnace_id} saqlandi.\n\n"
+        f"⚖️ Kirim: {input_kg:,.3f} kg\n"
+        f"🏭 Tayyor: {data['finished']:,.3f} kg ({finished_pct:.2f}%)\n"
+        f"♻️ Chiqit: {value:,.3f} kg ({scrap_pct:.2f}%)\n"
+        f"🔻 Jarayon yo‘qotishi: {loss:,.3f} kg ({loss_pct:.2f}%)\n\n"
+        f"Balans: {data['finished'] + value + loss:,.3f} kg",
+        reply_markup=menu_markup(),
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ---------- Sales ----------
+
+async def sale_start(update, context):
+    context.user_data["sale"] = {}
+    await update.message.reply_text("📦 Sotilgan mahsulot nomini kiriting:", reply_markup=cancel_markup())
+    return SALE_PRODUCT
+
+
+async def sale_product(update, context):
+    context.user_data["sale"]["product"] = update.message.text.strip()
+    await update.message.reply_text("⚖️ Necha kg sotildi?")
+    return SALE_KG
+
+
+async def sale_kg(update, context):
+    value = parse_decimal(update.message.text)
+    if value is None or value <= 0:
+        await update.message.reply_text("Kg noto‘g‘ri.")
+        return SALE_KG
+    context.user_data["sale"]["kg"] = value
+    await update.message.reply_text("💵 Sotuv narxi (1 kg) qancha?")
+    return SALE_PRICE
+
+
+async def sale_price(update, context):
+    value = parse_decimal(update.message.text)
+    if value is None or value < 0:
+        await update.message.reply_text("Narx noto‘g‘ri.")
+        return SALE_PRICE
+    context.user_data["sale"]["sale_price"] = value
+    await update.message.reply_text("📋 Tannarx (1 kg) qancha?")
+    return SALE_COST
+
+
+async def sale_cost(update, context):
+    value = parse_decimal(update.message.text)
+    if value is None or value < 0:
+        await update.message.reply_text("Tannarx noto‘g‘ri.")
+        return SALE_COST
+
+    data = context.user_data["sale"]
+    pool = pool_from(context)
+    if pool is None:
+        await update.message.reply_text("⚠️ Baza ulanmagan.")
+        return ConversationHandler.END
+
+    try:
+        sale_id = await db.create_sale(
+            pool, date.today(), data["product"], data["kg"],
+            data["sale_price"], value
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Saqlashda xato: {exc}")
+        return ConversationHandler.END
+
+    revenue = data["kg"] * data["sale_price"]
+    profit = data["kg"] * (data["sale_price"] - value)
+
+    await update.message.reply_text(
+        f"✅ Sotuv #{sale_id} saqlandi.\n\n"
+        f"📦 Mahsulot: {data['product']}\n"
+        f"⚖️ Miqdor: {data['kg']:,.3f} kg\n"
+        f"💰 Tushum: {revenue:,.0f} so‘m\n"
+        f"{'🟢 Foyda' if profit >= 0 else '🔴 Zarar'}: {abs(profit):,.0f} so‘m",
+        reply_markup=menu_markup(),
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ---------- Reports / stock / search ----------
+
+async def stock(update, context):
+    pool = pool_from(context)
+    if pool is None:
+        await update.message.reply_text("⚠️ Baza ulanmagan.")
+        return
+    rows = await db.stock_summary(pool)
+    if not rows:
+        await update.message.reply_text("📦 Ombor hozircha bo‘sh.")
+        return
+    lines = ["📦 OMBOR QOLDIG‘I", ""]
+    for row in rows:
+        kg = row["kg"]
+        if abs(float(kg)) > 0.0001:
+            lines.append(f"• {row['material']}: {kg:,.3f} kg")
+    await update.message.reply_text("\n".join(lines) if len(lines) > 2 else "📦 Ombor hozircha bo‘sh.")
+
+
+async def report(update, context):
+    pool = pool_from(context)
+    if pool is None:
+        await update.message.reply_text("⚠️ Baza ulanmagan.")
+        return
+    r = await db.report(pool)
+    await update.message.reply_text(
+        "📊 UMUMIY HISOBOT\n\n"
+        f"📦 Jami kirgan: {r['incoming_kg']:,.3f} kg\n"
+        f"🔥 Qozonlarga berilgan: {r['issued_kg']:,.3f} kg\n"
+        f"📦 Xomashyo qoldig‘i: {r['raw_stock_kg']:,.3f} kg\n"
+        f"🏭 Ishlab chiqarilgan: {r['finished_kg']:,.3f} kg\n"
+        f"💵 Tushum: {r['revenue']:,.0f} so‘m\n"
+        f"🟢 Foyda: {r['profit']:,.0f} so‘m\n"
+        f"🔴 Zarar: {r['loss']:,.0f} so‘m"
+    )
+
+
+async def search_start(update, context):
+    await update.message.reply_text("🔎 Mashina raqami yoki shaxs ismini kiriting:", reply_markup=cancel_markup())
+    return SEARCH_TEXT
+
+
+async def search_text(update, context):
+    pool = pool_from(context)
+    if pool is None:
+        await update.message.reply_text("⚠️ Baza ulanmagan.", reply_markup=menu_markup())
+        return ConversationHandler.END
+
+    rows = await db.search_loads(pool, update.message.text.strip())
+    if not rows:
+        await update.message.reply_text("Topilmadi.", reply_markup=menu_markup())
+        return ConversationHandler.END
+
+    lines = ["🔎 TOPILGAN YUKLAR", ""]
+    for r in rows:
+        initial = sum(Decimal(str(x["initial_kg"])) for x in r["items"])
+        accepted = initial - Decimal(str(r["skidka_kg"])) - Decimal(str(r["vozvrat_kg"]))
+        lines.append(
+            f"#{r['id']} | {r['vehicle_no']} | {r['person_name']}\n"
+            f"📅 {r['received_date']} | {accepted:,.3f} kg qabul qilingan"
+        )
+    await update.message.reply_text("\n\n".join(lines), reply_markup=menu_markup())
+    return ConversationHandler.END
+
+
+async def profit(update, context):
+    pool = pool_from(context)
+    if pool is None:
+        await update.message.reply_text("⚠️ Baza ulanmagan.")
+        return
+    value = await db.profit_loss(pool)
+    await update.message.reply_text(f"🟢 Jami foyda: {max(value, 0):,.0f} so‘m")
+
+
+async def loss(update, context):
+    pool = pool_from(context)
+    if pool is None:
+        await update.message.reply_text("⚠️ Baza ulanmagan.")
+        return
+    value = await db.profit_loss(pool)
+    await update.message.reply_text(f"🔴 Jami zarar: {max(-value, 0):,.0f} so‘m")
+
+
+async def text_router(update, context):
+    text = update.message.text
+    mapping = {
+        ADD_LOAD: load_start,
+        STOCK: stock,
+        REPORT: report,
+        SEARCH: search_start,
+        PROFIT: profit,
+        LOSS: loss,
+    }
+    if text in mapping:
+        result = await mapping[text](update, context)
+        return result
+
+    await update.message.reply_text(
+        "Menyudan kerakli bo‘limni tanlang.",
+        reply_markup=menu_markup(),
+    )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled bot error", exc_info=context.error)
+
+
+def register_handlers(application: Application):
+    load_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(f"^{ADD_LOAD}$"), load_start)],
         states={
             LOAD_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, load_date)],
             LOAD_VEHICLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, load_vehicle)],
@@ -483,24 +575,32 @@ def register_handlers(application: Application) -> None:
             LOAD_SKIDKA: [MessageHandler(filters.TEXT & ~filters.COMMAND, load_skidka)],
             LOAD_VOZVRAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, load_vozvrat)],
         },
-        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL}$"), cancel)],
-        allow_reentry=True,
-    ))
-    application.add_handler(ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(f"^({COPPER}|{BRASS}|{ALUMINUM})$"), furnace_start)],
-        states={
-            FURNACE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, furnace_date)],
-            FURNACE_MATERIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, furnace_material)],
-            FURNACE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, furnace_input)],
-            FURNACE_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, furnace_more)],
-            FURNACE_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, furnace_product)],
-            FURNACE_FINISHED: [MessageHandler(filters.TEXT & ~filters.COMMAND, furnace_finished)],
-            FURNACE_SCRAP: [MessageHandler(filters.TEXT & ~filters.COMMAND, furnace_scrap)],
-        },
-        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL}$"), cancel)],
-        allow_reentry=True,
-    ))
-    application.add_handler(ConversationHandler(
+        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(f"^{CANCEL}$"), cancel)],
+    )
+
+    furnace_convs = []
+    for kind, title in [
+        ("mis", COPPER),
+        ("latun", BRASS),
+        ("alyumin", ALUMINUM),
+    ]:
+        start_fn = furnace_start_factory(kind, title)
+        furnace_convs.append(
+            ConversationHandler(
+                entry_points=[MessageHandler(filters.Regex(f"^{title}$"), start_fn)],
+                states={
+                    FURNACE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, furnace_date)],
+                    FURNACE_MATERIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, furnace_material)],
+                    FURNACE_KG: [MessageHandler(filters.TEXT & ~filters.COMMAND, furnace_kg)],
+                    FURNACE_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, furnace_more)],
+                    FURNACE_FINISHED: [MessageHandler(filters.TEXT & ~filters.COMMAND, furnace_finished)],
+                    FURNACE_SCRAP: [MessageHandler(filters.TEXT & ~filters.COMMAND, furnace_scrap)],
+                },
+                fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(f"^{CANCEL}$"), cancel)],
+            )
+        )
+
+    sale_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(f"^{SALE}$"), sale_start)],
         states={
             SALE_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_product)],
@@ -508,18 +608,27 @@ def register_handlers(application: Application) -> None:
             SALE_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_price)],
             SALE_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_cost)],
         },
-        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL}$"), cancel)],
-        allow_reentry=True,
-    ))
-    application.add_handler(ConversationHandler(
+        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(f"^{CANCEL}$"), cancel)],
+    )
+
+    search_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(f"^{SEARCH}$"), search_start)],
         states={SEARCH_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_text)]},
-        fallbacks=[MessageHandler(filters.Regex(f"^{CANCEL}$"), cancel)],
-        allow_reentry=True,
-    ))
+        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(f"^{CANCEL}$"), cancel)],
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(
-        filters.Regex(f"^({'|'.join(map(lambda s: s.replace('🔥','🔥').replace('➕','➕'), [ADD_LOAD, COPPER, BRASS, ALUMINUM, SALE, STOCK, REPORT, SEARCH, PROFIT, LOSS]))})$"),
-        menu_router
-    ))
+    application.add_handler(CommandHandler("cancel", cancel))
+
+    application.add_handler(load_conv)
+    for conv in furnace_convs:
+        application.add_handler(conv)
+    application.add_handler(sale_conv)
+    application.add_handler(search_conv)
+
+    application.add_handler(MessageHandler(filters.Regex(f"^{STOCK}$"), stock))
+    application.add_handler(MessageHandler(filters.Regex(f"^{REPORT}$"), report))
+    application.add_handler(MessageHandler(filters.Regex(f"^{PROFIT}$"), profit))
+    application.add_handler(MessageHandler(filters.Regex(f"^{LOSS}$"), loss))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
