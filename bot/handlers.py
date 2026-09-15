@@ -10,9 +10,9 @@ logger = logging.getLogger(__name__)
 DB_KEY="db"; REDIS_KEY="redis"
 ADD_LOAD="➕ Yuk qabul qilish"; COPPER="🔥 Mis qozon"; BRASS="🔥 Latun qozon"; ALUMINUM="🔥 Alyumin qozon"
 SALE="💰 Sotuv"; STOCK="📦 Ombor"; FINISHED="🏭 Tayyor mahsulot"; REPORT="📊 Hisobot"; SEARCH="🔎 Qidirish"; PROFIT="🟢 Foyda"; LOSS="🔴 Zarar"
-EDIT="✏️ O‘zgartirish"; CANCEL="🚫 Bekor qilish"
+EDIT="✏️ O‘zgartirish"; ADJUST="⬇️ Yuk skidka / ↩️ Vozvrat"; CANCEL="🚫 Bekor qilish"
 LOAD_MATERIALS=['Qizil oddiy', 'Tros', 'Qizil lahim', 'Sariq', 'Radiator Sariq', 'Radiator qizil', 'Quyma sink', 'Karbyurator', 'Teplo', 'Alyumin zapchast', 'Alyumin chushka', 'Qizil skidka']
-MAIN_KEYBOARD=[[ADD_LOAD],[COPPER,BRASS],[ALUMINUM,SALE],[FINISHED,STOCK],[REPORT,SEARCH],[PROFIT,LOSS],[EDIT]]
+MAIN_KEYBOARD=[[ADD_LOAD],[COPPER,BRASS],[ALUMINUM,SALE],[FINISHED,STOCK],[REPORT,SEARCH],[PROFIT,LOSS],[ADJUST,EDIT]]
 FURNACE_MATERIALS={"mis":["Qizil","Qizil lahim","Tros"],
 "latun":["Sariq","Karbyurator","Radiator Qizil","Radiator Sariq","Sink"],
 "alyumin":["Alyumin zapchast","Alyumin chushka"]}
@@ -22,6 +22,8 @@ F_DATE,F_MATERIAL,F_KG,F_MORE,F_SCRAP,F_CUSTOM,F_ADJ_CONFIRM,F_ADJ_MATERIAL,F_AD
 S_PRODUCT,S_KG,S_PRICE,S_COST=range(17,21)
 EDIT_TYPE,EDIT_ID,EDIT_MATERIAL,EDIT_KG,EDIT_FINISHED,EDIT_SCRAP=range(21,27)
 SEARCH_TEXT=27
+ADJ_FURNACE,ADJ_MATERIAL,ADJ_TYPE,ADJ_KG,ADJ_MORE=range(28,33)
+LOADADJ_SEARCH,LOADADJ_LOAD,LOADADJ_MATERIAL,LOADADJ_SKIDKA_PCT,LOADADJ_VOZVRAT_KG=range(40,45)
 
 def menu_markup(): return ReplyKeyboardMarkup(MAIN_KEYBOARD,resize_keyboard=True)
 def cancel_markup(): return ReplyKeyboardMarkup([[CANCEL]],resize_keyboard=True)
@@ -231,10 +233,12 @@ async def furnace_scrap(update,context):
         f"📦 Material kirimi: {fmt_kg(inp)} kg\n"
         f"♻️ Chiqit: {fmt_kg(v)} kg\n"
         f"🔻 Jarayon yo‘qotishi: {fmt_kg(loss)} kg ({loss/inp*100:.2f}%)\n\n"
-        "⬇️ Shu qozon uchun skidka yoki vozvrat kiritasizmi?",
-        reply_markup=ReplyKeyboardMarkup([["✅ Ha","❌ Yo‘q"],[CANCEL]],resize_keyboard=True)
+        "⬇️ Skidka/vozvratni keyin ham istalgan vaqtda "
+        "«⬇️ Skidka / ↩️ Vozvrat» bo‘limidan kiritishingiz mumkin.",
+        reply_markup=menu_markup()
     )
-    return F_ADJ_CONFIRM
+    context.user_data.clear()
+    return ConversationHandler.END
 
 async def furnace_adjust_confirm(update,context):
     t=update.message.text
@@ -323,6 +327,259 @@ async def furnace_adjust_more(update,context):
     await update.message.reply_text("✅ Ha yoki ❌ Yo‘q ni tanlang.")
     return F_ADJ_MORE
 
+
+
+
+async def load_adjust_start(update,context):
+    await update.message.reply_text(
+        "⬇️ Yuk skidka / ↩️ Vozvrat\n\n"
+        "Yukni topish uchun quyidagilardan birini yozing:\n"
+        "📅 Sana: 15.09.2026\n"
+        "👤 Ism/familiya\n"
+        "🚚 Mashina raqami\n"
+        "⚖️ Kg: 1000",
+        reply_markup=ReplyKeyboardMarkup([[CANCEL]],resize_keyboard=True)
+    )
+    return LOADADJ_SEARCH
+
+async def load_adjust_search(update,context):
+    q=update.message.text.strip()
+    rows=await db.search_loads_for_adjustment(pool_from(context),q)
+    if not rows:
+        await update.message.reply_text(
+            "❌ Yuk topilmadi.\n"
+            "Sana, ism, mashina raqami yoki kg ni tekshirib qayta kiriting.",
+            reply_markup=ReplyKeyboardMarkup([[CANCEL]],resize_keyboard=True)
+        )
+        return LOADADJ_SEARCH
+    context.user_data["load_adj_loads"]=rows
+    buttons=[]
+    for x in rows:
+        total=sum(float(i.get("initial_kg",0)) for i in x["items"])
+        buttons.append([f"#{x.get('load_no') or x['id']} | {x['person_name']} | {fmt_kg(total)} kg"])
+    buttons.append([CANCEL])
+    await update.message.reply_text(
+        "🚚 Topilgan yuklardan keraklisini tanlang:",
+        reply_markup=ReplyKeyboardMarkup(buttons,resize_keyboard=True)
+    )
+    return LOADADJ_LOAD
+
+async def load_adjust_load(update,context):
+    text=update.message.text.strip()
+    rows=context.user_data.get("load_adj_loads",[])
+    selected=None
+    for x in rows:
+        total=sum(float(i.get("initial_kg",0)) for i in x["items"])
+        label=f"#{x.get('load_no') or x['id']} | {x['person_name']} | {fmt_kg(total)} kg"
+        if text==label:
+            selected=x; break
+    if not selected:
+        await update.message.reply_text("Yukni tugmadan tanlang.")
+        return LOADADJ_LOAD
+    context.user_data["load_adj_load"]=selected
+    buttons=[[f"{i['material']} — {fmt_kg(i['initial_kg'])} kg"] for i in selected["items"]]
+    buttons.append([CANCEL])
+    await update.message.reply_text(
+        f"🚚 Yuk #{selected.get('load_no') or selected['id']}\n"
+        f"📅 {selected['received_date'].strftime('%d.%m.%Y')}\n"
+        f"👤 {selected['person_name']}\n"
+        "📦 Materialni tanlang:",
+        reply_markup=ReplyKeyboardMarkup(buttons,resize_keyboard=True)
+    )
+    return LOADADJ_MATERIAL
+
+async def load_adjust_material(update,context):
+    text=update.message.text.strip()
+    selected=context.user_data["load_adj_load"]
+    item=None
+    for i in selected["items"]:
+        if text==f"{i['material']} — {fmt_kg(i['initial_kg'])} kg":
+            item=i; break
+    if not item:
+        await update.message.reply_text("Materialni tugmadan tanlang.")
+        return LOADADJ_MATERIAL
+    context.user_data["load_adj_material"]=item["material"]
+    summary=await db.load_material_adjustment_summary(
+        pool_from(context),selected["id"],item["material"]
+    )
+    old_pct=float(summary["skidka_percent"] or 0)
+    old_v=float(summary["vozvrat_kg"] or 0)
+    await update.message.reply_text(
+        f"📦 {item['material']}\n"
+        f"⚖️ Kelgan: {fmt_kg(item['initial_kg'])} kg\n"
+        f"⬇️ Hozirgi skidka: {old_pct:.2f}%\n"
+        f"↩️ Hozirgi vozvrat: {fmt_kg(old_v)} kg\n\n"
+        "📊 Yangi skidka foizini kiriting.\n"
+        "Ayrilmasa: 0",
+        reply_markup=cancel_markup()
+    )
+    return LOADADJ_SKIDKA_PCT
+
+async def load_adjust_skidka_pct(update,context):
+    v=parse_decimal(update.message.text)
+    if v is None or v<0 or v>100:
+        await update.message.reply_text("Foiz 0–100 oralig‘ida bo‘lishi kerak. Masalan: 2.5")
+        return LOADADJ_SKIDKA_PCT
+    context.user_data["load_adj_skidka_pct"]=v
+    await update.message.reply_text(
+        "↩️ Yangi vozvrat kg ni kiriting.\n"
+        "Ayrilmasa: 0",
+        reply_markup=cancel_markup()
+    )
+    return LOADADJ_VOZVRAT_KG
+
+async def load_adjust_vozvrat_kg(update,context):
+    v=parse_decimal(update.message.text)
+    if v is None or v<0:
+        await update.message.reply_text("Kg noto‘g‘ri. Masalan: 10")
+        return LOADADJ_VOZVRAT_KG
+    d=context.user_data
+    try:
+        initial,skidka_kg,vozvrat,final=await db.set_load_material_adjustment(
+            pool_from(context),d["load_adj_load"]["id"],d["load_adj_material"],
+            d["load_adj_skidka_pct"],v
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}",reply_markup=menu_markup())
+        context.user_data.clear()
+        return ConversationHandler.END
+    await update.message.reply_text(
+        f"✅ O‘zgartirildi.\n"
+        f"📦 {d['load_adj_material']}\n"
+        f"⚖️ Kelgan: {fmt_kg(initial)} kg\n"
+        f"⬇️ Skidka: {float(d['load_adj_skidka_pct']):.2f}% = {fmt_kg(skidka_kg)} kg\n"
+        f"↩️ Vozvrat: {fmt_kg(vozvrat)} kg\n"
+        f"📦 Qolgan/qabul: {fmt_kg(final)} kg",
+        reply_markup=menu_markup()
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+def adjust_furnace_markup(rows):
+    buttons=[]
+    for r in rows:
+        typ={"mis":"Mis","latun":"Latun","alyumin":"Alyumin"}.get(r["furnace_type"],r["furnace_type"])
+        buttons.append([f"#{r['id']} | {typ} | {r['furnace_date'].strftime('%d.%m.%Y')}"])
+    buttons.append([CANCEL])
+    return ReplyKeyboardMarkup(buttons,resize_keyboard=True)
+
+async def adjust_start(update,context):
+    pool=pool_from(context)
+    rows=await db.recent_furnaces_for_adjustment(pool,30)
+    if not rows:
+        await update.message.reply_text("Hali qozonlar ro‘yxatga olinmagan.",reply_markup=menu_markup())
+        return ConversationHandler.END
+    context.user_data["adjust_rows"]=rows
+    await update.message.reply_text(
+        "⬇️ Skidka / ↩️ Vozvrat\n"
+        "Qaysi qozondagi materialga o‘zgartirish kiritasiz?\n"
+        "Qozon raqamini tanlang:",
+        reply_markup=adjust_furnace_markup(rows)
+    )
+    return ADJ_FURNACE
+
+async def adjust_furnace(update,context):
+    text=update.message.text.strip()
+    if not text.startswith("#"):
+        await update.message.reply_text("Qozonni tugmadan tanlang.")
+        return ADJ_FURNACE
+    try:
+        furnace_id=int(text.split("|",1)[0].replace("#","").strip())
+    except Exception:
+        await update.message.reply_text("Qozon raqami noto‘g‘ri.")
+        return ADJ_FURNACE
+    rows=context.user_data.get("adjust_rows",[])
+    row=next((x for x in rows if int(x["id"])==furnace_id),None)
+    if not row:
+        await update.message.reply_text("Qozon topilmadi.")
+        return ADJ_FURNACE
+    materials=await db.furnace_materials_for_adjustment(pool_from(context),furnace_id)
+    context.user_data["adjust_furnace_id"]=furnace_id
+    context.user_data["adjust_materials"]=materials
+    buttons=[[f"{x['material']} — {fmt_kg(x['kg'])} kg"] for x in materials]
+    buttons.append([CANCEL])
+    await update.message.reply_text(
+        f"🔥 Qozon #{furnace_id}\n📦 Materialni tanlang:",
+        reply_markup=ReplyKeyboardMarkup(buttons,resize_keyboard=True)
+    )
+    return ADJ_MATERIAL
+
+async def adjust_material(update,context):
+    text=update.message.text.strip()
+    materials=context.user_data.get("adjust_materials",[])
+    selected=None
+    for x in materials:
+        if text.startswith(x["material"]+" —"):
+            selected=x
+            break
+    if not selected:
+        await update.message.reply_text("Materialni tugmadan tanlang.")
+        return ADJ_MATERIAL
+    context.user_data["adjust_material"]=selected["material"]
+    context.user_data["adjust_input_kg"]=selected["kg"]
+    await update.message.reply_text(
+        f"📦 {selected['material']}: {fmt_kg(selected['kg'])} kg\n"
+        "Qaysi o‘zgarish?",
+        reply_markup=ReplyKeyboardMarkup([["⬇️ Skidka","↩️ Vozvrat"],[CANCEL]],resize_keyboard=True)
+    )
+    return ADJ_TYPE
+
+async def adjust_type(update,context):
+    mp={"⬇️ Skidka":"skidka","↩️ Vozvrat":"vozvrat"}
+    t=mp.get(update.message.text.strip())
+    if not t:
+        await update.message.reply_text("⬇️ Skidka yoki ↩️ Vozvrat ni tanlang.")
+        return ADJ_TYPE
+    context.user_data["adjust_type"]=t
+    await update.message.reply_text(
+        f"⚖️ {t.title()} kg miqdorini kiriting:",
+        reply_markup=cancel_markup()
+    )
+    return ADJ_KG
+
+async def adjust_kg(update,context):
+    v=parse_decimal(update.message.text)
+    if v is None or v<=0:
+        await update.message.reply_text("Kg noto‘g‘ri. Masalan: 5")
+        return ADJ_KG
+    d=context.user_data
+    try:
+        aid=await db.create_furnace_adjustment(
+            pool_from(context),d["adjust_furnace_id"],d["adjust_material"],d["adjust_type"],v
+        )
+        rows=await db.get_furnace_adjustments(pool_from(context),d["adjust_furnace_id"])
+        last=next(r for r in rows if int(r["id"])==aid)
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}",reply_markup=menu_markup())
+        context.user_data.clear()
+        return ConversationHandler.END
+    typ="Skidka" if d["adjust_type"]=="skidka" else "Vozvrat"
+    await update.message.reply_text(
+        f"✅ {typ} saqlandi\n"
+        f"🔥 Qozon #{d['adjust_furnace_id']}\n"
+        f"📦 {d['adjust_material']}\n"
+        f"⚖️ {fmt_kg(v)} kg\n"
+        f"📊 {float(last['percent']):.2f}%\n\n"
+        "Yana boshqa materialga skidka/vozvrat kiritasizmi?",
+        reply_markup=ReplyKeyboardMarkup([["✅ Ha","❌ Yo‘q"],[CANCEL]],resize_keyboard=True)
+    )
+    return ADJ_MORE
+
+async def adjust_more(update,context):
+    t=update.message.text.strip()
+    if t=="❌ Yo‘q":
+        context.user_data.clear()
+        await update.message.reply_text("✅ Saqlandi.",reply_markup=menu_markup())
+        return ConversationHandler.END
+    if t=="✅ Ha":
+        materials=context.user_data.get("adjust_materials",[])
+        buttons=[[f"{x['material']} — {fmt_kg(x['kg'])} kg"] for x in materials]
+        buttons.append([CANCEL])
+        await update.message.reply_text("📦 Materialni tanlang:",reply_markup=ReplyKeyboardMarkup(buttons,resize_keyboard=True))
+        return ADJ_MATERIAL
+    await update.message.reply_text("✅ Ha yoki ❌ Yo‘q ni tanlang.")
+    return ADJ_MORE
 
 FINISHED_PRODUCTS=["Mis truba","Latun Truba","Latun Uzuk","Alyumin uzuk"]
 
@@ -493,48 +750,72 @@ async def fallback_text(update,context):
 
 def register_handlers(application):
     load=ConversationHandler(entry_points=[MessageHandler(filters.Regex(f"^{ADD_LOAD}$"),load_start)],
-      states={LOAD_CONFIRM:[MessageHandler(filters.TEXT&~filters.COMMAND,load_confirm)],LOAD_DATE:[MessageHandler(filters.TEXT&~filters.COMMAND,load_date)],
-      LOAD_VEHICLE:[MessageHandler(filters.TEXT&~filters.COMMAND,load_vehicle)],LOAD_PERSON:[MessageHandler(filters.TEXT&~filters.COMMAND,load_person)],
-      LOAD_MATERIAL:[MessageHandler(filters.TEXT&~filters.COMMAND,load_material)],LOAD_KG:[MessageHandler(filters.TEXT&~filters.COMMAND,load_kg)],
-      LOAD_PRICE:[MessageHandler(filters.TEXT&~filters.COMMAND,load_price)],LOAD_MORE:[MessageHandler(filters.TEXT&~filters.COMMAND,load_more)],LOAD_CUSTOM:[MessageHandler(filters.TEXT&~filters.COMMAND,load_custom)]},
+      states={LOAD_CONFIRM:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_confirm)],LOAD_DATE:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_date)],
+      LOAD_VEHICLE:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_vehicle)],LOAD_PERSON:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_person)],
+      LOAD_MATERIAL:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_material)],LOAD_KG:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_kg)],
+      LOAD_PRICE:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_price)],LOAD_MORE:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_more)],LOAD_CUSTOM:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_custom)]},
       fallbacks=[CommandHandler("cancel",cancel),MessageHandler(filters.Regex(f"^{CANCEL}$"),cancel)])
     application.add_handler(CommandHandler("start",start)); application.add_handler(CommandHandler("help",help_command)); application.add_handler(CommandHandler("cancel",cancel))
     application.add_handler(load)
     for kind,title in [("mis",COPPER),("latun",BRASS),("alyumin",ALUMINUM)]:
         conv=ConversationHandler(entry_points=[MessageHandler(filters.Regex(f"^{title}$"),furnace_start_factory(kind,title))],
-          states={F_MATERIAL:[MessageHandler(filters.TEXT&~filters.COMMAND,furnace_material)],F_CUSTOM:[MessageHandler(filters.TEXT&~filters.COMMAND,furnace_custom)],F_KG:[MessageHandler(filters.TEXT&~filters.COMMAND,furnace_kg)],
-          F_MORE:[MessageHandler(filters.TEXT&~filters.COMMAND,furnace_more)],F_SCRAP:[MessageHandler(filters.TEXT&~filters.COMMAND,furnace_scrap)],
-          F_CUSTOM:[MessageHandler(filters.TEXT&~filters.COMMAND,furnace_custom)],
-          F_ADJ_CONFIRM:[MessageHandler(filters.TEXT&~filters.COMMAND,furnace_adjust_confirm)],
-          F_ADJ_MATERIAL:[MessageHandler(filters.TEXT&~filters.COMMAND,furnace_adjust_material)],
-          F_ADJ_TYPE:[MessageHandler(filters.TEXT&~filters.COMMAND,furnace_adjust_type)],
-          F_ADJ_KG:[MessageHandler(filters.TEXT&~filters.COMMAND,furnace_adjust_kg)],
-          F_ADJ_MORE:[MessageHandler(filters.TEXT&~filters.COMMAND,furnace_adjust_more)]},
+          states={F_MATERIAL:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),furnace_material)],F_CUSTOM:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),furnace_custom)],F_KG:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),furnace_kg)],
+          F_MORE:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),furnace_more)],F_SCRAP:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),furnace_scrap)],
+          F_CUSTOM:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),furnace_custom)],
+          F_ADJ_CONFIRM:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),furnace_adjust_confirm)],
+          F_ADJ_MATERIAL:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),furnace_adjust_material)],
+          F_ADJ_TYPE:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),furnace_adjust_type)],
+          F_ADJ_KG:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),furnace_adjust_kg)],
+          F_ADJ_MORE:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),furnace_adjust_more)]},
           fallbacks=[CommandHandler("cancel",cancel),MessageHandler(filters.Regex(f"^{CANCEL}$"),cancel)])
         application.add_handler(conv)
     finished=ConversationHandler(
       entry_points=[MessageHandler(filters.Regex(f"^{FINISHED}$"),finished_start)],
       states={
-        S_PRODUCT:[MessageHandler(filters.TEXT&~filters.COMMAND,finished_product)],
-        S_KG:[MessageHandler(filters.TEXT&~filters.COMMAND,finished_kg)]
+        S_PRODUCT:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),finished_product)],
+        S_KG:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),finished_kg)]
       },
       fallbacks=[CommandHandler("cancel",cancel),MessageHandler(filters.Regex(f"^{CANCEL}$"),cancel)]
     )
     application.add_handler(finished)
 
     sale=ConversationHandler(entry_points=[MessageHandler(filters.Regex(f"^{SALE}$"),sale_start)],
-      states={S_PRODUCT:[MessageHandler(filters.TEXT&~filters.COMMAND,sale_product)],S_KG:[MessageHandler(filters.TEXT&~filters.COMMAND,sale_kg)],
-      S_PRICE:[MessageHandler(filters.TEXT&~filters.COMMAND,sale_price)],S_COST:[MessageHandler(filters.TEXT&~filters.COMMAND,sale_cost)]},
+      states={S_PRODUCT:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),sale_product)],S_KG:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),sale_kg)],
+      S_PRICE:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),sale_price)],S_COST:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),sale_cost)]},
       fallbacks=[CommandHandler("cancel",cancel),MessageHandler(filters.Regex(f"^{CANCEL}$"),cancel)])
     search=ConversationHandler(entry_points=[MessageHandler(filters.Regex(f"^{SEARCH}$"),search_start)],
-      states={SEARCH_TEXT:[MessageHandler(filters.TEXT&~filters.COMMAND,search_text)]},
+      states={SEARCH_TEXT:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),search_text)]},
       fallbacks=[CommandHandler("cancel",cancel),MessageHandler(filters.Regex(f"^{CANCEL}$"),cancel)])
     edit=ConversationHandler(entry_points=[MessageHandler(filters.Regex(f"^{EDIT}$"),edit_start)],
-      states={EDIT_TYPE:[MessageHandler(filters.TEXT&~filters.COMMAND,edit_type)],EDIT_ID:[MessageHandler(filters.TEXT&~filters.COMMAND,edit_id)],
-      EDIT_MATERIAL:[MessageHandler(filters.TEXT&~filters.COMMAND,edit_material)],EDIT_KG:[MessageHandler(filters.TEXT&~filters.COMMAND,edit_kg)],
-      EDIT_FINISHED:[MessageHandler(filters.TEXT&~filters.COMMAND,edit_finished)],EDIT_SCRAP:[MessageHandler(filters.TEXT&~filters.COMMAND,edit_scrap)]},
+      states={EDIT_TYPE:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),edit_type)],EDIT_ID:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),edit_id)],
+      EDIT_MATERIAL:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),edit_material)],EDIT_KG:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),edit_kg)],
+      EDIT_FINISHED:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),edit_finished)],EDIT_SCRAP:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),edit_scrap)]},
       fallbacks=[CommandHandler("cancel",cancel),MessageHandler(filters.Regex(f"^{CANCEL}$"),cancel)])
+    adjust=ConversationHandler(
+      entry_points=[MessageHandler(filters.Regex(f"^{ADJUST}$"),adjust_start)],
+      states={
+        ADJ_FURNACE:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),adjust_furnace)],
+        ADJ_MATERIAL:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),adjust_material)],
+        ADJ_TYPE:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),adjust_type)],
+        ADJ_KG:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),adjust_kg)],
+        ADJ_MORE:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),adjust_more)]
+      },
+      fallbacks=[CommandHandler("cancel",cancel),MessageHandler(filters.Regex(f"^{CANCEL}$"),cancel)]
+    )
+    application.add_handler(adjust)
+    load_adjust=ConversationHandler(
+      entry_points=[MessageHandler(filters.Regex(f"^{ADJUST}$"),load_adjust_start)],
+      states={
+        LOADADJ_SEARCH:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_adjust_search)],
+        LOADADJ_LOAD:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_adjust_load)],
+        LOADADJ_MATERIAL:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_adjust_material)],
+        LOADADJ_SKIDKA_PCT:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_adjust_skidka_pct)],
+        LOADADJ_VOZVRAT_KG:[MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),load_adjust_vozvrat_kg)]
+      },
+      fallbacks=[CommandHandler("cancel",cancel),MessageHandler(filters.Regex(f"^{CANCEL}$"),cancel)]
+    )
+    application.add_handler(load_adjust)
     for h in [sale,search,edit]: application.add_handler(h)
     application.add_handler(MessageHandler(filters.Regex(f"^{STOCK}$"),stock)); application.add_handler(MessageHandler(filters.Regex(f"^{REPORT}$"),report))
     application.add_handler(MessageHandler(filters.Regex(f"^{PROFIT}$"),profit)); application.add_handler(MessageHandler(filters.Regex(f"^{LOSS}$"),loss))
-    application.add_handler(MessageHandler(filters.TEXT&~filters.COMMAND,fallback_text))
+    application.add_handler(MessageHandler(filters.TEXT&~filters.COMMAND&~filters.Regex(f"^{CANCEL}$"),fallback_text))
