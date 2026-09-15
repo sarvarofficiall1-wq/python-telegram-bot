@@ -27,6 +27,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS active_date_confirmed BOOLEAN NOT NUL
 
 CREATE TABLE IF NOT EXISTS loads (
     id BIGSERIAL PRIMARY KEY,
+    load_no INTEGER,
     received_date DATE NOT NULL,
     vehicle_no TEXT NOT NULL,
     person_name TEXT NOT NULL,
@@ -35,6 +36,20 @@ CREATE TABLE IF NOT EXISTS loads (
     vozvrat_kg NUMERIC(18,3) NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE loads ADD COLUMN IF NOT EXISTS load_no INTEGER;
+
+WITH numbered AS (
+    SELECT id, ROW_NUMBER() OVER (PARTITION BY received_date ORDER BY id) AS rn
+    FROM loads
+)
+UPDATE loads l
+SET load_no = n.rn
+FROM numbered n
+WHERE l.id = n.id AND l.load_no IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_loads_date_load_no
+ON loads(received_date, load_no);
 
 CREATE TABLE IF NOT EXISTS furnaces (
     id BIGSERIAL PRIMARY KEY,
@@ -58,6 +73,17 @@ CREATE TABLE IF NOT EXISTS finished_products (
 
 CREATE INDEX IF NOT EXISTS idx_finished_products_date ON finished_products(production_date);
 CREATE INDEX IF NOT EXISTS idx_finished_products_product ON finished_products(product);
+
+CREATE TABLE IF NOT EXISTS furnace_adjustments (
+    id BIGSERIAL PRIMARY KEY,
+    furnace_id BIGINT NOT NULL REFERENCES furnaces(id) ON DELETE CASCADE,
+    material TEXT NOT NULL,
+    adjustment_type TEXT NOT NULL CHECK (adjustment_type IN ('skidka','vozvrat')),
+    kg NUMERIC(18,3) NOT NULL CHECK (kg >= 0),
+    percent NUMERIC(10,4) NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_furnace_adjustments_furnace ON furnace_adjustments(furnace_id);
 
 CREATE TABLE IF NOT EXISTS sales (
     id BIGSERIAL PRIMARY KEY,
@@ -118,24 +144,46 @@ def _json_items(items):
         })
     return out
 
-async def create_load(pool, received_date, vehicle_no, person_name, items, skidka_kg, vozvrat_kg):
+async def create_load(pool, received_date, vehicle_no, person_name, items, skidka_kg=0, vozvrat_kg=0):
     items_json = _json_items(items)
     total = sum(float(x["initial_kg"]) for x in items_json)
-    deduction = float(skidka_kg) + float(vozvrat_kg)
     if total <= 0:
         raise ValueError("Yuk kg 0 dan katta boâlishi kerak")
-    if deduction > total:
-        raise ValueError("Skidka + vozvrat boshlangâich kg dan katta")
-    for x in items_json:
-        initial = float(x["initial_kg"])
-        accepted = max(0.0, initial - deduction * initial / total)
-        x["accepted_kg"] = str(round(accepted, 3))
+
+    # Yuk qabul qilishda skidka/vozvrat 0 boâladi.
+    # Raqam kun boâyicha avtomatik 1, 2, 3... qilib beriladi.
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(824731)")
+            load_no = await conn.fetchval("""
+                SELECT COALESCE(MAX(load_no), 0) + 1
+                FROM loads
+                WHERE received_date=$1
+            """, received_date)
+            for x in items_json:
+                x["accepted_kg"] = str(round(float(x["initial_kg"]), 3))
+            row = await conn.fetchrow("""
+                INSERT INTO loads(
+                    load_no,received_date,vehicle_no,person_name,items,skidka_kg,vozvrat_kg
+                )
+                VALUES($1,$2,$3,$4,$5::jsonb,0,0)
+                RETURNING id, load_no
+            """, int(load_no), received_date, vehicle_no, person_name,
+                 json.dumps(items_json, ensure_ascii=False))
+            return int(row["id"]), int(row["load_no"])
+
+async def daily_load_total(pool, received_date):
     row = await pool.fetchrow("""
-        INSERT INTO loads(received_date,vehicle_no,person_name,items,skidka_kg,vozvrat_kg)
-        VALUES($1,$2,$3,$4::jsonb,$5,$6) RETURNING id
-    """, received_date, vehicle_no, person_name, json.dumps(items_json, ensure_ascii=False),
-       skidka_kg, vozvrat_kg)
-    return int(row["id"])
+        SELECT COALESCE(SUM(
+            (SELECT COALESCE(SUM((item->>'initial_kg')::numeric),0)
+             FROM jsonb_array_elements(items) AS item)
+        ),0) AS total_kg,
+        COUNT(*) AS load_count
+        FROM loads
+        WHERE received_date=$1
+    """, received_date)
+    return float(row["total_kg"] or 0), int(row["load_count"] or 0)
+
 
 def _load(row):
     d = dict(row)
@@ -285,6 +333,56 @@ async def update_sale_kg(pool, sale_id, new_kg):
     await pool.execute("UPDATE sales SET kg=$2,revenue=$3,profit=$4 WHERE id=$1",
                        sale_id, new_kg, revenue, profit)
     return True
+
+
+async def create_furnace_adjustment(pool, furnace_id, material, adjustment_type, kg):
+    kg = Decimal(str(kg))
+    if kg <= 0:
+        raise ValueError("Kg 0 dan katta boâlishi kerak")
+    if adjustment_type not in ("skidka", "vozvrat"):
+        raise ValueError("Turi notoâgâri")
+
+    row = await pool.fetchrow("SELECT items FROM furnaces WHERE id=$1", furnace_id)
+    if not row:
+        raise ValueError("Qozon ID topilmadi")
+    items = row["items"] if isinstance(row["items"], list) else json.loads(row["items"])
+    material_key = material.strip().lower()
+    input_kg = sum(
+        Decimal(str(x.get("kg", 0)))
+        for x in items
+        if str(x.get("material", "")).strip().lower() == material_key
+    )
+    if input_kg <= 0:
+        raise ValueError("Bu material qozonda topilmadi")
+
+    old = await pool.fetchval("""
+        SELECT COALESCE(SUM(kg),0)
+        FROM furnace_adjustments
+        WHERE furnace_id=$1 AND material=$2
+    """, furnace_id, material)
+    old = Decimal(str(old or 0))
+    if old + kg > input_kg:
+        raise ValueError(f"{material} uchun skidka+vozvrat {input_kg} kg dan oshmasligi kerak")
+
+    pct = (kg / input_kg) * Decimal("100")
+    row = await pool.fetchrow("""
+        INSERT INTO furnace_adjustments(furnace_id,material,adjustment_type,kg,percent)
+        VALUES($1,$2,$3,$4,$5)
+        RETURNING id
+    """, furnace_id, material, adjustment_type, kg, pct)
+    return int(row["id"])
+
+async def get_furnace_adjustments(pool, furnace_id):
+    return await pool.fetch("""
+        SELECT id, furnace_id, material, adjustment_type, kg, percent, created_at
+        FROM furnace_adjustments
+        WHERE furnace_id=$1
+        ORDER BY id
+    """, furnace_id)
+
+async def furnace_adjustment_summary(pool, furnace_id):
+    rows = await get_furnace_adjustments(pool, furnace_id)
+    return [dict(r) for r in rows]
 
 async def stock_summary(pool):
     rows = await pool.fetch("""
