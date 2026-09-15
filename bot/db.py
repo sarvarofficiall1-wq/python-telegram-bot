@@ -1,3 +1,4 @@
+from datetime import date, datetime
 def fmt_kg(value):
     try:
         v=float(value)
@@ -73,6 +74,16 @@ CREATE TABLE IF NOT EXISTS finished_products (
 
 CREATE INDEX IF NOT EXISTS idx_finished_products_date ON finished_products(production_date);
 CREATE INDEX IF NOT EXISTS idx_finished_products_product ON finished_products(product);
+
+CREATE TABLE IF NOT EXISTS load_adjustments (
+    id BIGSERIAL PRIMARY KEY,
+    load_id BIGINT NOT NULL REFERENCES loads(id) ON DELETE CASCADE,
+    material TEXT NOT NULL,
+    skidka_percent NUMERIC(10,4) NOT NULL DEFAULT 0,
+    vozvrat_kg NUMERIC(18,3) NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_load_adjustments_load ON load_adjustments(load_id);
 
 CREATE TABLE IF NOT EXISTS furnace_adjustments (
     id BIGSERIAL PRIMARY KEY,
@@ -382,6 +393,202 @@ async def get_furnace_adjustments(pool, furnace_id):
 
 async def furnace_adjustment_summary(pool, furnace_id):
     rows = await get_furnace_adjustments(pool, furnace_id)
+    return [dict(r) for r in rows]
+
+
+
+
+async def search_loads_for_adjustment(pool, search_text):
+    s = str(search_text or "").strip()
+    # Exact date dd.mm.yyyy, otherwise search person/vehicle, otherwise numeric kg.
+    rows = []
+    try:
+        dt = datetime.strptime(s, "%d.%m.%Y").date()
+    except Exception:
+        dt = None
+
+    if dt:
+        rows = await pool.fetch("""
+            SELECT id, load_no, received_date, vehicle_no, person_name, items
+            FROM loads WHERE received_date=$1
+            ORDER BY load_no NULLS LAST, id
+        """, dt)
+    else:
+        rows = await pool.fetch("""
+            SELECT id, load_no, received_date, vehicle_no, person_name, items
+            FROM loads
+            WHERE vehicle_no ILIKE $1 OR person_name ILIKE $1
+            ORDER BY received_date DESC, load_no NULLS LAST, id DESC
+            LIMIT 50
+        """, f"%{s}%")
+        if not rows:
+            try:
+                kg = Decimal(str(s).replace(",", ".").replace("kg","").strip())
+                rows = await pool.fetch("""
+                    SELECT id, load_no, received_date, vehicle_no, person_name, items
+                    FROM loads
+                    WHERE EXISTS (
+                      SELECT 1 FROM jsonb_array_elements(items) item
+                      WHERE ABS((item->>'initial_kg')::numeric - $1) < 0.0005
+                    )
+                    ORDER BY received_date DESC, load_no NULLS LAST, id DESC
+                    LIMIT 50
+                """, kg)
+            except Exception:
+                rows = []
+    out=[]
+    for r in rows:
+        x=dict(r)
+        if isinstance(x["items"],str):
+            x["items"]=json.loads(x["items"])
+        out.append(x)
+    return out
+
+async def set_load_material_adjustment(pool, load_id, material, skidka_percent, vozvrat_kg):
+    p=Decimal(str(skidka_percent or 0))
+    v=Decimal(str(vozvrat_kg or 0))
+    if p<0 or p>100:
+        raise ValueError("Skidka foizi 0 dan 100 gacha boâlishi kerak")
+    if v<0:
+        raise ValueError("Vozvrat kg manfiy boâlmaydi")
+    row=await pool.fetchrow("SELECT items FROM loads WHERE id=$1",load_id)
+    if not row: raise ValueError("Yuk topilmadi")
+    items=row["items"] if isinstance(row["items"],list) else json.loads(row["items"])
+    item=next((x for x in items if str(x.get("material",""))==material),None)
+    if not item: raise ValueError("Material topilmadi")
+    initial=Decimal(str(item.get("initial_kg",0)))
+    skidka_kg=initial*p/Decimal("100")
+    final=initial-skidka_kg-v
+    if final<0:
+        raise ValueError("Skidka va vozvrat jami material kgidan oshib ketadi")
+
+    await pool.execute("DELETE FROM load_adjustments WHERE load_id=$1 AND material=$2",load_id,material)
+    await pool.execute("""
+        INSERT INTO load_adjustments(load_id,material,skidka_percent,vozvrat_kg)
+        VALUES($1,$2,$3,$4)
+    """,load_id,material,p,v)
+    return initial, skidka_kg, v, final
+
+async def recent_load_dates(pool, limit=30):
+    rows = await pool.fetch("""
+        SELECT received_date, COUNT(*) AS load_count,
+               COALESCE(SUM((SELECT COALESCE(SUM((item->>'initial_kg')::numeric),0)
+                             FROM jsonb_array_elements(items) AS item)),0) AS total_kg
+        FROM loads
+        GROUP BY received_date
+        ORDER BY received_date DESC
+        LIMIT $1
+    """, limit)
+    return [dict(r) for r in rows]
+
+async def loads_by_date(pool, received_date):
+    rows = await pool.fetch("""
+        SELECT id, load_no, received_date, vehicle_no, person_name, items
+        FROM loads
+        WHERE received_date=$1
+        ORDER BY load_no NULLS LAST, id
+    """, received_date)
+    out=[]
+    for r in rows:
+        x=dict(r)
+        if isinstance(x["items"], str):
+            x["items"]=json.loads(x["items"])
+        out.append(x)
+    return out
+
+async def load_material_adjustment_summary(pool, load_id, material):
+    row = await pool.fetchrow("""
+        SELECT
+          COALESCE(SUM(skidka_percent),0) AS skidka_percent,
+          COALESCE(SUM(vozvrat_kg),0) AS vozvrat_kg
+        FROM load_adjustments
+        WHERE load_id=$1 AND material=$2
+    """, load_id, material)
+    return dict(row) if row else {"skidka_percent":0,"vozvrat_kg":0}
+
+async def create_load_adjustment(pool, load_id, material, skidka_percent, vozvrat_kg):
+    p = Decimal(str(skidka_percent or 0))
+    v = Decimal(str(vozvrat_kg or 0))
+    if p < 0 or p > 100:
+        raise ValueError("Skidka foizi 0 dan 100 gacha boâlishi kerak")
+    if v < 0:
+        raise ValueError("Vozvrat kg manfiy boâlmaydi")
+    row = await pool.fetchrow("SELECT items FROM loads WHERE id=$1", load_id)
+    if not row:
+        raise ValueError("Yuk topilmadi")
+    items=row["items"] if isinstance(row["items"],list) else json.loads(row["items"])
+    item=next((x for x in items if str(x.get("material",""))==material),None)
+    if not item:
+        raise ValueError("Bu material tanlangan yukda topilmadi")
+    initial=Decimal(str(item.get("initial_kg",0)))
+    if initial<=0:
+        raise ValueError("Material kg notoâgâri")
+    old=await load_material_adjustment_summary(pool,load_id,material)
+    oldp=Decimal(str(old["skidka_percent"] or 0))
+    oldv=Decimal(str(old["vozvrat_kg"] or 0))
+    if oldp+p>100:
+        raise ValueError("Jami skidka foizi 100% dan oshmasligi kerak")
+    # Vozvrat must not exceed kg left after cumulative skidka and previous return.
+    final_after=(initial*(Decimal("1")-(oldp+p)/Decimal("100")))-(oldv+v)
+    if final_after < 0:
+        raise ValueError("Skidka va vozvrat jami material kgidan oshib ketadi")
+    row=await pool.fetchrow("""
+        INSERT INTO load_adjustments(load_id,material,skidka_percent,vozvrat_kg)
+        VALUES($1,$2,$3,$4)
+        RETURNING id
+    """,load_id,material,p,v)
+    return int(row["id"]), initial, oldp+p, oldv+v, final_after
+
+async def load_adjustment_details(pool, load_id):
+    rows=await pool.fetch("""
+        SELECT material,
+               COALESCE(SUM(skidka_percent),0) AS skidka_percent,
+               COALESCE(SUM(vozvrat_kg),0) AS vozvrat_kg
+        FROM load_adjustments
+        WHERE load_id=$1
+        GROUP BY material
+        ORDER BY material
+    """,load_id)
+    return [dict(r) for r in rows]
+
+async def recent_furnaces_for_adjustment(pool, limit=20):
+    rows = await pool.fetch("""
+        SELECT id, furnace_date, furnace_type, items, created_at
+        FROM furnaces
+        ORDER BY id DESC
+        LIMIT $1
+    """, limit)
+    out=[]
+    for r in rows:
+        x=dict(r)
+        if isinstance(x["items"], str):
+            x["items"]=json.loads(x["items"])
+        out.append(x)
+    return out
+
+async def furnace_materials_for_adjustment(pool, furnace_id):
+    row=await pool.fetchrow("SELECT items FROM furnaces WHERE id=$1", furnace_id)
+    if not row:
+        return []
+    items=row["items"] if isinstance(row["items"],list) else json.loads(row["items"])
+    result=[]
+    for x in items:
+        name=str(x.get("material",""))
+        kg=float(x.get("kg",0))
+        if name and kg>0:
+            result.append({"material":name,"kg":kg})
+    return result
+
+async def adjustment_details(pool, furnace_id):
+    rows=await pool.fetch("""
+        SELECT material,
+               COALESCE(SUM(CASE WHEN adjustment_type='skidka' THEN kg ELSE 0 END),0) AS skidka_kg,
+               COALESCE(SUM(CASE WHEN adjustment_type='vozvrat' THEN kg ELSE 0 END),0) AS vozvrat_kg
+        FROM furnace_adjustments
+        WHERE furnace_id=$1
+        GROUP BY material
+        ORDER BY material
+    """, furnace_id)
     return [dict(r) for r in rows]
 
 async def stock_summary(pool):
