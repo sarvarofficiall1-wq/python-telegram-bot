@@ -1,4 +1,3 @@
-
 """Factory accounting Telegram handlers."""
 import logging
 from decimal import Decimal, InvalidOperation
